@@ -1,0 +1,88 @@
+version: "3"
+
+env:
+  GOBIN: "{{ .ROOT_DIR }}/bin"
+  PATH: "{{ .GOBIN }}:{{ .PATH }}"
+
+tasks:
+  install-binary:
+    cmds:
+      - go install {{ .DEP_MODULE }}@{{ .DEP_VERSION }}
+    status:
+      - test -d {{ .GOBIN }}
+      - test -f {{ .GOBIN }}/{{ base .DEP_MODULE }}
+    internal: true
+
+  binaries:
+    deps:
+      - task: install-binary
+        vars:
+          DEP_VERSION: v1.50.0
+          DEP_MODULE: github.com/golangci/golangci-lint/cmd/golangci-lint
+
+      - task: install-binary
+        vars:
+          DEP_VERSION: latest
+          DEP_MODULE: golang.org/x/tools/cmd/goimports
+
+      - task: install-binary
+        vars:
+          DEP_VERSION: latest
+          DEP_MODULE: github.com/grpc-ecosystem/grpc-gateway/v2/protoc-gen-grpc-gateway
+
+      - task: install-binary
+        vars:
+          DEP_VERSION: latest
+          DEP_MODULE: github.com/grpc-ecosystem/grpc-gateway/v2/protoc-gen-openapiv2
+
+      - task: install-binary
+        vars:
+          DEP_VERSION: latest
+          DEP_MODULE: google.golang.org/grpc/cmd/protoc-gen-go-grpc
+
+      - task: install-binary
+        vars:
+          DEP_VERSION: latest
+          DEP_MODULE: google.golang.org/protobuf/cmd/protoc-gen-go
+
+  lint:
+    deps: [binaries]
+    cmds:
+      - golangci-lint run {{ .ROOT_DIR }}/...
+
+  imports:
+    deps: [binaries]
+    cmds:
+      - goimports -w {{ .ROOT_DIR }}
+
+  generate:
+    cmds:
+      - |
+        protoc \
+        --proto_path internal/api \
+        --proto_path third_party \
+        --grpc-gateway_out internal/api \
+        --grpc-gateway_opt logtostderr=true \
+        --grpc-gateway_opt paths=source_relative \
+        --grpc-gateway_opt generate_unbound_methods=true \
+        --openapiv2_out internal/api \
+        --openapiv2_opt logtostderr=true \
+        --go_out internal/api \
+        --go_opt paths=source_relative \
+        --go-grpc_out internal/api \
+        --go-grpc_opt paths=source_relative \
+        internal/api/blackhole.proto
+  build:
+    cmds:
+      - go build -o {{ .GOBIN }}/blackhole {{ .ROOT_DIR }}/cmd/blackhole
+
+  tidy:
+    cmds:
+      - go mod tidy
+
+  precommit:
+    cmds:
+      - task: tidy
+      - task: imports
+      - task: lint
+      - task: build

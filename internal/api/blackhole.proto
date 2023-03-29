@@ -1,0 +1,25 @@
+syntax = "proto3";
+package denisdubovitskiy.blackhole.api;
+option go_package = "github.com/denisdubovitskiy/blackhole/internal/api;api";
+
+import "google/api/annotations.proto";
+import "google/protobuf/empty.proto";
+
+message DomainsRequest {
+  repeated string domains = 1;
+}
+
+service Blackhole {
+  rpc Block(DomainsRequest) returns (google.protobuf.Empty) {
+    option (google.api.http) = {
+      post: "/block"
+      body: "*"
+    };
+  }
+  rpc Unblock(DomainsRequest) returns (google.protobuf.Empty) {
+    option (google.api.http) = {
+      post: "/unblock"
+      body: "*"
+    };
+  }
+}
