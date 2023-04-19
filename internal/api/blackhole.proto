@@ -9,6 +9,10 @@ message DomainsRequest {
   repeated string domains = 1;
 }
 
+message AddSourceRequest {
+  string url = 1;
+}
+
 service Blackhole {
   rpc Block(DomainsRequest) returns (google.protobuf.Empty) {
     option (google.api.http) = {
@@ -19,6 +23,18 @@ service Blackhole {
   rpc Unblock(DomainsRequest) returns (google.protobuf.Empty) {
     option (google.api.http) = {
       post: "/unblock"
+      body: "*"
+    };
+  }
+  rpc AddSource(AddSourceRequest) returns (google.protobuf.Empty) {
+    option (google.api.http) = {
+      post: "/sources"
+      body: "*"
+    };
+  }
+  rpc RefreshSources(google.protobuf.Empty) returns (google.protobuf.Empty) {
+    option (google.api.http) = {
+      post: "/refresh"
       body: "*"
     };
   }

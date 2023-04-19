@@ -3,6 +3,7 @@ version: "3"
 env:
   GOBIN: "{{ .ROOT_DIR }}/bin"
   PATH: "{{ .GOBIN }}:{{ .PATH }}"
+  CGO_ENABLED: "1"
 
 tasks:
   install-binary:
@@ -48,17 +49,18 @@ tasks:
   lint:
     deps: [binaries]
     cmds:
-      - golangci-lint run {{ .ROOT_DIR }}/...
+      - PATH={{ .PATH }} golangci-lint run {{ .ROOT_DIR }}/...
 
   imports:
     deps: [binaries]
     cmds:
-      - goimports -w {{ .ROOT_DIR }}
+      - PATH={{ .PATH }} goimports -w {{ .ROOT_DIR }}
 
   generate:
+    deps: [binaries]
     cmds:
       - |
-        protoc \
+        PATH={{ .PATH }} protoc \
         --proto_path internal/api \
         --proto_path third_party \
         --grpc-gateway_out internal/api \
@@ -86,3 +88,6 @@ tasks:
       - task: imports
       - task: lint
       - task: build
+  run:
+    cmds:
+      - go run {{ .ROOT_DIR }}/cmd/blackhole/main.go

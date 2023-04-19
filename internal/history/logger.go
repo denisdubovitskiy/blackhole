@@ -56,7 +56,7 @@ type Logger interface {
 	io.Closer
 }
 
-func New(w io.Writer) Logger {
+func NewLogger(w io.Writer) Logger {
 	config := zap.NewProductionEncoderConfig()
 	config.EncodeTime = zapcore.ISO8601TimeEncoder
 
@@ -88,4 +88,4 @@ func (l *logger) Save(entry Record) {
 	)
 }
 
-func NewNop() Logger { return New(io.Discard) }
+func NewNop() Logger { return NewLogger(io.Discard) }

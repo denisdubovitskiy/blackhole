@@ -2,19 +2,18 @@ package server
 
 import (
 	"context"
+	"expvar"
 	"fmt"
 	"net"
 	"time"
+
+	"go.uber.org/atomic"
 
 	"github.com/denisdubovitskiy/blackhole/internal/cache"
 	"github.com/denisdubovitskiy/blackhole/internal/history"
 	"github.com/denisdubovitskiy/blackhole/internal/resolver"
 	"github.com/miekg/dns"
 	"go.uber.org/zap"
-)
-
-const (
-	blacklistBucketsCount = 512
 )
 
 type Config struct {
@@ -47,6 +46,11 @@ func New(config Config) *Server {
 			ReadTimeout:  5 * time.Second,
 			WriteTimeout: 5 * time.Second,
 		},
+
+		blocked:  atomic.NewInt32(0),
+		resolved: atomic.NewInt32(0),
+		failed:   atomic.NewInt32(0),
+		cached:   atomic.NewInt32(0),
 	}
 	if s.logger == nil {
 		s.logger = zap.NewNop()
@@ -63,11 +67,15 @@ func New(config Config) *Server {
 	udpHandler.HandleFunc(".", s.handler)
 	s.udp.Handler = udpHandler
 
+	expvar.Publish("blackhole_server", expvar.Func(func() any {
+		return s.dumpStats()
+	}))
+
 	return s
 }
 
 type Blacklist interface {
-	Has(server string) bool
+	Has(ctx context.Context, server string) bool
 }
 
 type Resolver interface {
@@ -93,6 +101,11 @@ type Server struct {
 	history         History
 	blockTTLSeconds uint32
 	logger          *zap.Logger
+
+	blocked  *atomic.Int32
+	resolved *atomic.Int32
+	cached   *atomic.Int32
+	failed   *atomic.Int32
 }
 
 func (s *Server) Run(ctx context.Context) error {
@@ -148,12 +161,13 @@ func (s *Server) handler(w dns.ResponseWriter, req *dns.Msg) {
 			zap.String("client", w.RemoteAddr().String()),
 			zap.String("domain", question.Name),
 		)
+		s.cached.Inc()
 		return
 	}
 
 	// блокируем
 	if (question.Qtype == dns.TypeA || question.Qtype == dns.TypeAAAA) &&
-		s.blacklist.Has(question.Name) {
+		s.blacklist.Has(context.Background(), question.Name) {
 
 		s.blockDomain(w, question, req)
 		s.history.Save(history.NewBlocked(w.RemoteAddr(), question))
@@ -162,6 +176,7 @@ func (s *Server) handler(w dns.ResponseWriter, req *dns.Msg) {
 			zap.String("client", w.RemoteAddr().String()),
 			zap.String("domain", question.Name),
 		)
+		s.blocked.Inc()
 		return
 	}
 
@@ -176,6 +191,7 @@ func (s *Server) handler(w dns.ResponseWriter, req *dns.Msg) {
 			zap.String("domain", question.Name),
 			zap.Error(err),
 		)
+		s.failed.Inc()
 		return
 	}
 
@@ -191,6 +207,7 @@ func (s *Server) handler(w dns.ResponseWriter, req *dns.Msg) {
 		zap.String("client", w.RemoteAddr().String()),
 		zap.String("domain", question.Name),
 	)
+	s.resolved.Inc()
 }
 
 func (s *Server) writeMsg(w dns.ResponseWriter, msg *dns.Msg) {
@@ -243,6 +260,22 @@ func (s *Server) respondFromCache(w dns.ResponseWriter, req *dns.Msg, cached dns
 	response.Answer = append(response.Answer, cached)
 
 	w.WriteMsg(response)
+}
+
+type stats struct {
+	Blocked  int32 `json:"blocked"`
+	Resolved int32 `json:"resolved"`
+	Failed   int32 `json:"failed"`
+	Cached   int32 `json:"cached"`
+}
+
+func (s *Server) dumpStats() stats {
+	return stats{
+		Blocked:  s.blocked.Load(),
+		Resolved: s.resolved.Load(),
+		Failed:   s.failed.Load(),
+		Cached:   s.cached.Load(),
+	}
 }
 
 var (
