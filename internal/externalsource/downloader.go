@@ -12,7 +12,7 @@ type HTTP interface {
 	Do(r *http.Request) (*http.Response, error)
 }
 type Downloader interface {
-	ForEach(ctx context.Context, url string, f func(d string)) error
+	ForEach(ctx context.Context, url string, f func(d string) error) error
 }
 
 func NewDownloader(http HTTP) Downloader {
@@ -23,7 +23,7 @@ type downloader struct {
 	http HTTP
 }
 
-func (d *downloader) ForEach(ctx context.Context, url string, f func(d string)) error {
+func (d *downloader) ForEach(ctx context.Context, url string, f func(d string) error) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, http.NoBody)
 	if err != nil {
 		return fmt.Errorf("downloader: unable to compose request for %s: %v", url, err)
@@ -52,7 +52,9 @@ func (d *downloader) ForEach(ctx context.Context, url string, f func(d string)) 
 		if isKnown(row) {
 			continue
 		}
-		f(row)
+		if err := f(row); err != nil {
+			return err
+		}
 	}
 	return nil
 }

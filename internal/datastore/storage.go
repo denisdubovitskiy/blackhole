@@ -5,8 +5,10 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"time"
 
 	_ "github.com/mattn/go-sqlite3"
+	"go.uber.org/zap"
 )
 
 type Storage interface {
@@ -15,40 +17,27 @@ type Storage interface {
 	ForEachSource(ctx context.Context, f func(d string)) error
 	AddSource(ctx context.Context, url string) error
 	AddDomains(ctx context.Context, domains []string) error
+	AddHistoryRecords(ctx context.Context, records []HistoryRecord) error
+	Cleanup(ctx context.Context, skip int) error
+	RunPeriodicCleanup(ctx context.Context)
 }
 
 type storage struct {
-	db *sql.DB
+	db          *sql.DB
+	historySize int
+	log         *zap.Logger
 }
 
 func Open(path string) (*sql.DB, error) {
 	return sql.Open("sqlite3", path)
 }
 
-func New(db *sql.DB) Storage {
+func New(db *sql.DB, historySize int, log *zap.Logger) Storage {
 	return &storage{
-		db: db,
+		db:          db,
+		historySize: historySize,
+		log:         log,
 	}
-}
-
-func (s *storage) AddDomains(ctx context.Context, domains []string) error {
-	if len(domains) == 0 {
-		return nil
-	}
-
-	q := `INSERT INTO domains (domain) VALUES `
-	q += strings.TrimSuffix(strings.Repeat("(?),", len(domains)), ",")
-	q += ` ON CONFLICT DO NOTHING;`
-
-	args := make([]any, len(domains))
-	for i, domain := range domains {
-		args[i] = domain
-	}
-
-	if _, err := s.db.ExecContext(ctx, q, args...); err != nil {
-		return fmt.Errorf("storage: unable to perform migration: %v", err)
-	}
-	return nil
 }
 
 const migration = `
@@ -67,11 +56,105 @@ CREATE TABLE IF NOT EXISTS sources (
 
 CREATE UNIQUE INDEX IF NOT EXISTS sources_url_ux
 ON sources (url);
+
+CREATE TABLE IF NOT EXISTS history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    domain TEXT,
+    type TEXT,
+    status TEXT,
+    client_addr TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
 `
 
 func (s *storage) Migrate(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, migration); err != nil {
 		return fmt.Errorf("storage: unable to perform migration: %v", err)
+	}
+	return nil
+}
+
+const idForRemovalQuery = `
+SELECT id
+FROM history
+ORDER BY id DESC
+LIMIT 1
+OFFSET ?;
+`
+
+const cleanupQuery = `
+DELETE
+FROM history
+WHERE id < ?;
+`
+
+func (s *storage) Cleanup(ctx context.Context, skip int) error {
+	row := s.db.QueryRowContext(ctx, idForRemovalQuery, skip)
+	var id int64
+
+	if err := row.Scan(&id); err != nil {
+		return err
+	}
+
+	if err := row.Err(); err != nil {
+		return err
+	}
+
+	if id == 0 {
+		return nil
+	}
+
+	if _, err := s.db.ExecContext(ctx, cleanupQuery, id); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+type HistoryRecord struct {
+	Type       string
+	Domain     string
+	Status     string
+	ClientAddr string
+}
+
+func (s *storage) AddHistoryRecords(ctx context.Context, records []HistoryRecord) error {
+	if len(records) == 0 {
+		return nil
+	}
+
+	q := `INSERT INTO history (domain, type, status, client_addr) VALUES `
+	q += strings.TrimSuffix(strings.Repeat("(?, ?, ?, ?),", len(records)), ",")
+	q += ` ON CONFLICT DO NOTHING;`
+
+	args := make([]any, 0, len(records)*4)
+	for _, record := range records {
+		args = append(args, record.Domain, record.Type, record.Status, record.ClientAddr)
+	}
+
+	if _, err := s.db.ExecContext(ctx, q, args...); err != nil {
+		return fmt.Errorf("storage: unable to save history: %v", err)
+	}
+
+	return nil
+}
+
+func (s *storage) AddDomains(ctx context.Context, domains []string) error {
+	if len(domains) == 0 {
+		return nil
+	}
+
+	q := `INSERT INTO domains (domain) VALUES `
+	q += strings.TrimSuffix(strings.Repeat("(?),", len(domains)), ",")
+	q += ` ON CONFLICT DO NOTHING;`
+
+	args := make([]any, len(domains))
+	for i, domain := range domains {
+		args[i] = domain
+	}
+
+	if _, err := s.db.ExecContext(ctx, q, args...); err != nil {
+		return fmt.Errorf("storage: unable to add domains: %v", err)
 	}
 	return nil
 }
@@ -202,4 +285,25 @@ func (s *storage) ForEachSource(ctx context.Context, f func(d string)) error {
 	}
 
 	return nil
+}
+
+func (s *storage) RunPeriodicCleanup(ctx context.Context) {
+	ticker := time.NewTimer(5 * time.Minute)
+
+	go func() {
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+
+			case <-ticker.C:
+				s.log.Debug("storage: running periodic history cleanup")
+				if err := s.Cleanup(ctx, s.historySize); err != nil {
+					s.log.Error("storage: unable to cleanup history", zap.Error(err))
+				}
+			}
+		}
+	}()
 }

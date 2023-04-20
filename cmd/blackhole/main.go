@@ -8,25 +8,21 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/denisdubovitskiy/blackhole/internal/listeners/dnsserver"
-
 	"github.com/denisdubovitskiy/blackhole/internal/blacklist"
 	"github.com/denisdubovitskiy/blackhole/internal/configuration"
 	"github.com/denisdubovitskiy/blackhole/internal/datastore"
-	"github.com/denisdubovitskiy/blackhole/internal/debug"
 	"github.com/denisdubovitskiy/blackhole/internal/externalsource"
 	"github.com/denisdubovitskiy/blackhole/internal/handler"
 	"github.com/denisdubovitskiy/blackhole/internal/history"
+	"github.com/denisdubovitskiy/blackhole/internal/listeners/debug"
+	"github.com/denisdubovitskiy/blackhole/internal/listeners/dnsserver"
 	"github.com/denisdubovitskiy/blackhole/internal/listeners/grpcgateway"
 	"github.com/denisdubovitskiy/blackhole/internal/listeners/grpcserver"
 	"github.com/denisdubovitskiy/blackhole/internal/listeners/swagger"
-	"github.com/denisdubovitskiy/blackhole/internal/logrotate"
 	"github.com/denisdubovitskiy/blackhole/internal/provider/sources"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
-
-const blacklistBucketsCount = 256
 
 func main() {
 	config := configuration.Parse()
@@ -42,18 +38,7 @@ func main() {
 	)
 	defer log.Sync()
 
-	bl := blacklist.New(blacklistBucketsCount)
-
-	historyFile := logrotate.Open(logrotate.Options{
-		Filename:         config.HistoryFile,
-		MaxSizeMegabytes: config.HistoryMaxSizeMegabytes,
-		MaxFiles:         config.HistoryMaxFiles,
-		MaxAgeDays:       config.HistoryMaxAgeDays,
-	})
-	defer historyFile.Close()
-
-	historyLogger := history.NewLogger(historyFile)
-	defer historyLogger.Close()
+	bl := blacklist.New(config.BlacklistBucketsCount)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
@@ -65,7 +50,8 @@ func main() {
 	}
 	log.Debug("database is opened")
 
-	storage := datastore.New(database)
+	storage := datastore.New(database, config.HistorySize, log)
+	storage.RunPeriodicCleanup(ctx)
 
 	migrateCtx, migrateCancel := context.WithTimeout(ctx, 5*time.Second)
 	defer migrateCancel()
@@ -78,7 +64,9 @@ func main() {
 	log.Debug("database schema is up to date")
 
 	downloader := externalsource.NewDownloader(http.DefaultClient)
-	sourceProvider := sources.NewProvider(storage)
+	sourceProvider := sources.NewProvider(storage, downloader)
+	historyLogger := history.NewLogger(storage, log)
+	historyLogger.Run(ctx)
 
 	sourceProvider.OnRefreshSource(func(url string) {
 		go func() {
@@ -86,33 +74,13 @@ func main() {
 			defer downloadCancel()
 
 			log.Debug("downloader: starting update from list", zap.String("url", url))
-
-			chunkSize := 100
-			chunk := make([]string, 0, chunkSize)
-
-			// Добавлен новый источник доменов для блокировки
-			err := downloader.ForEach(downloadCtx, url, func(domain string) {
-				chunk = append(chunk, domain)
-				if len(chunk) == chunkSize {
-					if err := storage.AddDomains(ctx, chunk); err != nil {
-						log.Error("downloader: unable to add domains", zap.Error(err))
-					}
-
-					chunk = chunk[:0]
-				}
-			})
-			if err != nil {
-				log.Error("downloader: unable to perform update from the list", zap.String("url", url), zap.Error(err))
-			} else {
-				log.Debug("downloader: update finished", zap.String("url", url))
+			if err := sourceProvider.RefreshFromSource(downloadCtx, url); err != nil {
+				log.Error("downloader: unable to refresh from source", zap.Error(err))
 			}
-			if len(chunk) > 0 {
-				if err := storage.AddDomains(ctx, chunk); err != nil {
-					log.Error("downloader: unable to add domains", zap.Error(err))
-				}
-			}
+			log.Debug("downloader: update finished", zap.String("url", url))
 		}()
 	})
+
 	controller := handler.New(bl, sourceProvider)
 
 	ui := swagger.NewUI(config.SwaggerAddr, config.HttpAddr, log)
@@ -128,15 +96,15 @@ func main() {
 	gw.Run(ctx)
 
 	go func() {
-		log.Debug("populating blacklist from the database")
+		log.Debug("migration: populating blacklist from the database")
 		// Прогрев черного списка на старте из базы данных
 		forEachErr := storage.ForEachDomain(ctx, func(domain string) {
 			bl.Add(ctx, domain)
 		})
 		if forEachErr != nil {
-			log.Fatal("unable to populate blacklist from the database", zap.Error(forEachErr))
+			log.Fatal("migration: unable to populate blacklist from the database", zap.Error(forEachErr))
 		}
-		log.Debug("blacklist is up to date")
+		log.Debug("migration: blacklist is up to date")
 	}()
 
 	dnsServer := dnsserver.New(dnsserver.Config{

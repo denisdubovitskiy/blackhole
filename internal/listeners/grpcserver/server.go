@@ -33,14 +33,18 @@ func (s *server) Run(ctx context.Context) {
 	pb.RegisterBlackholeServer(grpcServer, s.controller)
 
 	go func() {
+		s.log.Debug("running gRPC server", zap.String("address", s.addr))
+
 		lis, err := net.Listen("tcp", s.addr)
 		if err != nil {
 			log.Fatal("unable to listen grpc", zap.Error(err))
 		}
+
 		if err := grpcServer.Serve(lis); err != nil {
 			s.log.Error("grpc dnsserver error", zap.Error(err))
 		}
 	}()
+
 	go func() {
 		<-ctx.Done()
 		grpcServer.GracefulStop()

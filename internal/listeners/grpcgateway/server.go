@@ -52,6 +52,7 @@ func (s *server) Run(ctx context.Context) {
 		Addr:    s.httpAddr,
 	}
 	go func() {
+		s.log.Debug("running gRPC gateway server", zap.String("address", s.httpAddr))
 		if err := gwServer.ListenAndServe(); err != http.ErrServerClosed {
 			log.Fatal("http dnsserver error", zap.Error(err))
 		}

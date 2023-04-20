@@ -1,11 +1,12 @@
 package history
 
 import (
-	"io"
+	"context"
+	"fmt"
 	"net"
+	"time"
 
-	"go.uber.org/zap/zapcore"
-
+	"github.com/denisdubovitskiy/blackhole/internal/datastore"
 	"github.com/miekg/dns"
 	"go.uber.org/zap"
 )
@@ -13,6 +14,8 @@ import (
 type Status string
 
 const (
+	chunkSize = 100
+
 	StatusCached   Status = "cached"
 	StatusBlocked  Status = "blocked"
 	StatusFailed   Status = "failed"
@@ -30,9 +33,16 @@ func NewRecord(remoteAddr net.Addr, question dns.Question, status Status) Record
 	return Record{
 		Qtype:      dns.TypeToString[question.Qtype],
 		Name:       question.Name,
-		ClientAddr: remoteAddr.String(),
+		ClientAddr: stripRemoteAddr(remoteAddr.String()),
 		Status:     status,
 	}
+}
+
+func stripRemoteAddr(s string) string {
+	if h, _, err := net.SplitHostPort(s); err == nil {
+		return h
+	}
+	return s
 }
 
 func NewCached(remoteAddr net.Addr, question dns.Question) Record {
@@ -53,39 +63,113 @@ func NewResolved(remoteAddr net.Addr, question dns.Question) Record {
 
 type Logger interface {
 	Save(entry Record)
-	io.Closer
+	Run(ctx context.Context)
 }
 
-func NewLogger(w io.Writer) Logger {
-	config := zap.NewProductionEncoderConfig()
-	config.EncodeTime = zapcore.ISO8601TimeEncoder
+type Storage interface {
+	AddHistoryRecords(ctx context.Context, records []datastore.HistoryRecord) error
+}
 
-	core := zapcore.NewCore(
-		zapcore.NewJSONEncoder(config),
-		zapcore.AddSync(w),
-		zapcore.InfoLevel,
-	)
-
-	return &logger{logger: zap.New(core)}
+func NewLogger(storage Storage, log *zap.Logger) Logger {
+	return &logger{
+		storage: storage,
+		events:  make(chan Record, chunkSize),
+		log:     log,
+	}
 }
 
 type logger struct {
-	events chan Record
-	logger *zap.Logger
+	events  chan Record
+	storage Storage
+	log     *zap.Logger
 }
 
 func (l *logger) Close() error {
-	return l.logger.Sync()
+	return nil
 }
 
 func (l *logger) Save(entry Record) {
-	l.logger.Info(
-		"incoming request",
-		zap.String("domain", entry.Name),
-		zap.String("type", entry.Qtype),
-		zap.String("status", string(entry.Status)),
-		zap.String("client", entry.ClientAddr),
-	)
+	l.events <- entry
 }
 
-func NewNop() Logger { return NewLogger(io.Discard) }
+func (l *logger) Run(ctx context.Context) {
+	ticker := time.NewTicker(time.Minute)
+
+	go func() {
+		defer ticker.Stop()
+
+		chunk := make([]Record, 0, chunkSize)
+
+		for {
+			select {
+			case <-ctx.Done():
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				if err := l.saveChunk(ctx, chunk); err != nil {
+					l.log.Error("history: unable to save chunk", zap.Error(err))
+				}
+				cancel()
+				return
+
+			case <-ticker.C:
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				if err := l.saveChunk(ctx, chunk); err != nil {
+					l.log.Error("history: unable to save chunk", zap.Error(err))
+				}
+				cancel()
+				chunk = chunk[:0]
+				continue
+
+			case e, ok := <-l.events:
+				if !ok {
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					if err := l.saveChunk(ctx, chunk); err != nil {
+						l.log.Error("history: unable to save chunk", zap.Error(err))
+					}
+					cancel()
+					return
+				}
+
+				chunk = append(chunk, e)
+				if len(chunk) == chunkSize {
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					if err := l.saveChunk(ctx, chunk); err != nil {
+						l.log.Error("history: unable to save chunk", zap.Error(err))
+					}
+					cancel()
+					chunk = chunk[:0]
+				}
+				continue
+			}
+		}
+	}()
+}
+
+func (l *logger) saveChunk(ctx context.Context, chunk []Record) error {
+	records := make([]datastore.HistoryRecord, len(chunk))
+
+	for i, rec := range chunk {
+		records[i] = datastore.HistoryRecord{
+			Type:       rec.Qtype,
+			Domain:     rec.Name,
+			Status:     string(rec.Status),
+			ClientAddr: rec.ClientAddr,
+		}
+	}
+
+	if err := l.storage.AddHistoryRecords(ctx, records); err != nil {
+		return fmt.Errorf("unable to save records: %v", err)
+	}
+
+	return nil
+}
+
+var nilStore Storage = &nilStorage{}
+
+type nilStorage struct {
+}
+
+func (n nilStorage) AddHistoryRecords(ctx context.Context, records []datastore.HistoryRecord) error {
+	return nil
+}
+
+func NewNop() Logger { return NewLogger(nilStore, zap.NewNop()) }

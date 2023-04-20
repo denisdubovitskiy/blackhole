@@ -36,13 +36,24 @@ func NewUI(
 
 func (u *ui) newServer() *http.Server {
 	mux := http.NewServeMux()
-	mux.Handle("/", swaggerui.New("Blackhole", "/swagger.json", "/"))
+	mux.Handle(
+		"/",
+		swaggerui.New(
+			"Blackhole",
+			"/swagger.json",
+			"/",
+		),
+	)
 	mux.HandleFunc("/swagger.json", func(writer http.ResponseWriter, request *http.Request) {
-		swg := bytes.ReplaceAll(pb.SwaggerUI, []byte(`"swagger": "2.0",`), []byte(`"swagger": "2.0","host": "`+u.targetAddr+`",`))
+		swg := bytes.ReplaceAll(
+			pb.SwaggerUI,
+			[]byte(`"swagger": "2.0",`),
+			[]byte(`"swagger": "2.0","host": "`+u.targetAddr+`",`),
+		)
 
 		if _, err := writer.Write(swg); err != nil {
 			u.log.Error(
-				"unable to write a swagger definition",
+				"swagger: unable to write a swagger definition",
 				zap.String("component", "http"),
 				zap.Error(err),
 			)
@@ -59,7 +70,7 @@ func (u *ui) Run(ctx context.Context) {
 	server := u.newServer()
 
 	go func() {
-		u.log.Debug("running Swagger UI", zap.String("address", u.uiAddr))
+		u.log.Debug("running Swagger UI server", zap.String("address", u.uiAddr))
 		if err := server.ListenAndServe(); err != http.ErrServerClosed {
 			log.Fatal("http dnsserver error", zap.Error(err))
 		}

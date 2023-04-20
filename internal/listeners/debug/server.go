@@ -32,9 +32,9 @@ func (s *server) Run(ctx context.Context) {
 		Addr:    s.addr,
 	}
 	go func() {
-		s.log.Debug("running debug dnsserver", zap.String("address", s.addr))
+		s.log.Debug("running debug server", zap.String("address", s.addr))
 		if err := debugServer.ListenAndServe(); err != http.ErrServerClosed {
-			log.Fatal("debug dnsserver error", zap.Error(err))
+			log.Fatal("debug server error", zap.Error(err))
 		}
 	}()
 	go func() {
@@ -44,7 +44,7 @@ func (s *server) Run(ctx context.Context) {
 		defer cancel()
 
 		if err := debugServer.Shutdown(shutdownCtx); err != nil {
-			s.log.Error("unable to shut debug dnsserver down gracefully", zap.Error(err))
+			s.log.Error("unable to shut debug server down gracefully", zap.Error(err))
 		}
 	}()
 }
