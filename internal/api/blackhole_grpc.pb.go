@@ -81,7 +81,7 @@ func (c *blackholeClient) RefreshSources(ctx context.Context, in *emptypb.Empty,
 	return out, nil
 }
 
-// BlackholeServer is the server API for Blackhole service.
+// BlackholeServer is the dnsserver API for Blackhole service.
 // All implementations must embed UnimplementedBlackholeServer
 // for forward compatibility
 type BlackholeServer interface {

@@ -1,4 +1,4 @@
-package server
+package dnsserver
 
 import (
 	"context"
@@ -131,6 +131,7 @@ func (s *Server) Run(ctx context.Context) error {
 		case <-errch:
 			cancel()
 			s.shutdown()
+			return nil
 		case <-ctx.Done():
 			s.shutdown()
 			return nil

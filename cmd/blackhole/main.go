@@ -1,34 +1,29 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"expvar"
-	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
-	"github.com/denisdubovitskiy/blackhole/internal/externalsource"
-	"github.com/denisdubovitskiy/blackhole/internal/provider/sources"
+	"github.com/denisdubovitskiy/blackhole/internal/listeners/dnsserver"
 
-	pb "github.com/denisdubovitskiy/blackhole/internal/api"
 	"github.com/denisdubovitskiy/blackhole/internal/blacklist"
 	"github.com/denisdubovitskiy/blackhole/internal/configuration"
 	"github.com/denisdubovitskiy/blackhole/internal/datastore"
+	"github.com/denisdubovitskiy/blackhole/internal/debug"
+	"github.com/denisdubovitskiy/blackhole/internal/externalsource"
 	"github.com/denisdubovitskiy/blackhole/internal/handler"
 	"github.com/denisdubovitskiy/blackhole/internal/history"
+	"github.com/denisdubovitskiy/blackhole/internal/listeners/grpcgateway"
+	"github.com/denisdubovitskiy/blackhole/internal/listeners/grpcserver"
+	"github.com/denisdubovitskiy/blackhole/internal/listeners/swagger"
 	"github.com/denisdubovitskiy/blackhole/internal/logrotate"
-	"github.com/denisdubovitskiy/blackhole/internal/server"
-	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
-	"github.com/rs/cors"
-	swaggerui "github.com/swaggest/swgui/v3emb"
+	"github.com/denisdubovitskiy/blackhole/internal/provider/sources"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 )
 
 const blacklistBucketsCount = 256
@@ -82,64 +77,9 @@ func main() {
 	}
 	log.Debug("database schema is up to date")
 
-	mux := http.NewServeMux()
-	mux.Handle("/", swaggerui.New("Blackhole", "/swagger.json", "/"))
-	mux.HandleFunc("/swagger.json", func(writer http.ResponseWriter, request *http.Request) {
-		swg := bytes.ReplaceAll(pb.SwaggerUI, []byte(`"swagger": "2.0",`), []byte(`"swagger": "2.0","host": "`+config.HttpAddr+`",`))
-
-		if _, err := writer.Write(swg); err != nil {
-			log.Error(
-				"unable to write a swagger definition",
-				zap.String("component", "http"),
-				zap.Error(err),
-			)
-		}
-	})
-
-	openapiServer := http.Server{
-		Handler: mux,
-		Addr:    config.SwaggerAddr,
-	}
-	go func() {
-		log.Debug("running Swagger UI", zap.String("address", config.SwaggerAddr))
-		if err := openapiServer.ListenAndServe(); err != http.ErrServerClosed {
-			log.Fatal("http server error", zap.Error(err))
-		}
-	}()
-	go func() {
-		<-ctx.Done()
-
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-
-		if err := openapiServer.Shutdown(shutdownCtx); err != nil {
-			log.Error("unable to shut http server down gracefully", zap.Error(err))
-		}
-	}()
-
-	debugServer := http.Server{
-		Handler: expvar.Handler(),
-		Addr:    config.DebugAddr,
-	}
-	go func() {
-		log.Debug("running debug server", zap.String("address", config.DebugAddr))
-		if err := debugServer.ListenAndServe(); err != http.ErrServerClosed {
-			log.Fatal("debug server error", zap.Error(err))
-		}
-	}()
-	go func() {
-		<-ctx.Done()
-
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-
-		if err := debugServer.Shutdown(shutdownCtx); err != nil {
-			log.Error("unable to shut debug server down gracefully", zap.Error(err))
-		}
-	}()
-
 	downloader := externalsource.NewDownloader(http.DefaultClient)
 	sourceProvider := sources.NewProvider(storage)
+
 	sourceProvider.OnRefreshSource(func(url string) {
 		go func() {
 			downloadCtx, downloadCancel := context.WithTimeout(ctx, time.Minute)
@@ -175,52 +115,17 @@ func main() {
 	})
 	controller := handler.New(bl, sourceProvider)
 
-	grpcServer := grpc.NewServer()
-	pb.RegisterBlackholeServer(grpcServer, controller)
+	ui := swagger.NewUI(config.SwaggerAddr, config.HttpAddr, log)
+	ui.Run(ctx)
 
-	go func() {
-		lis, err := net.Listen("tcp", config.GrpcAddr)
-		if err != nil {
-			log.Fatal("unable to listen grpc", zap.Error(err))
-		}
-		if err := grpcServer.Serve(lis); err != nil {
-			log.Error("grpc server error", zap.Error(err))
-		}
-	}()
-	go func() {
-		<-ctx.Done()
-		grpcServer.GracefulStop()
-	}()
+	ds := debug.NewServer(config.DebugAddr, log)
+	ds.Run(ctx)
 
-	gwMux := runtime.NewServeMux()
-	gwErr := pb.RegisterBlackholeHandlerFromEndpoint(
-		ctx,
-		gwMux,
-		config.GrpcAddr,
-		[]grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())},
-	)
-	if gwErr != nil {
-		log.Fatal("unable to register a gateway", zap.Error(gwErr))
-	}
-	gwServer := http.Server{
-		Handler: cors.AllowAll().Handler(gwMux),
-		Addr:    config.HttpAddr,
-	}
-	go func() {
-		if err := gwServer.ListenAndServe(); err != http.ErrServerClosed {
-			log.Fatal("http server error", zap.Error(err))
-		}
-	}()
-	go func() {
-		<-ctx.Done()
+	gs := grpcserver.New(config.GrpcAddr, controller, log)
+	gs.Run(ctx)
 
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-
-		if err := gwServer.Shutdown(shutdownCtx); err != nil {
-			log.Error("unable to shut http server down gracefully", zap.Error(err))
-		}
-	}()
+	gw := grpcgateway.NewServer(config.GrpcAddr, config.HttpAddr, log)
+	gw.Run(ctx)
 
 	go func() {
 		log.Debug("populating blacklist from the database")
@@ -234,7 +139,7 @@ func main() {
 		log.Debug("blacklist is up to date")
 	}()
 
-	dnsServer := server.New(server.Config{
+	dnsServer := dnsserver.New(dnsserver.Config{
 		BlockTTL: 10 * time.Second,
 		UpstreamDNSServers: []string{
 			// google
@@ -259,6 +164,6 @@ func main() {
 	})
 	log.Debug("starting DNS server")
 	if err := dnsServer.Run(ctx); err != nil {
-		log.Error("DNS server listen error", zap.Error(err))
+		log.Error("DNS dnsserver listen error", zap.Error(err))
 	}
 }
